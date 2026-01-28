@@ -17,6 +17,7 @@ Changelog entries are grouped by type, with the following types:
 ## [Unreleased] - ReleaseDate
 
 ### Added
+
 - Added tool approval feature for requiring user confirmation before tool execution
   - `NeedsApproval` enum with `Always`, `Never`, and `Dynamic` variants
   - `ToolApprovalRequest` and `ToolApprovalResponse` types for the approval flow
@@ -24,6 +25,9 @@ Changelog entries are grouped by type, with the following types:
   - `pending_tool_approvals()` and `has_pending_approvals()` methods on response types
   - `Message::ToolApproval` variant and `MessageBuilder::tool_approval()` method
   - Non-blocking approval flow matching the Vercel AI SDK pattern
+- Added `headers` parameter to `LanguageModelOptions` for additional HTTP headers
+  - `headers()` method on request builder to set custom HTTP headers per request
+  - Headers are passed through to all HTTP-based providers (OpenAI, Anthropic, Google, etc.)
 
 ## [0.4.0] - 2026-01-24
 

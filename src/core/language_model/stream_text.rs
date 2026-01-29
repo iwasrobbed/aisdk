@@ -221,6 +221,9 @@ impl<M: LanguageModel> LanguageModelRequest<M> {
                     }
                 };
 
+                // Collect tool calls for parallel execution after stream completes
+                let mut tool_calls_to_execute: Vec<ToolCallInfo> = Vec::new();
+
                 while let Some(ref chunk) = response.next().await {
                     match chunk {
                         Ok(chunk) => {
@@ -300,21 +303,21 @@ impl<M: LanguageModel> LanguageModelRequest<M> {
                                                         ),
                                                     );
                                                 } else {
-                                                    // Execute tool immediately (original behavior)
+                                                    // Add assistant message for tool call
                                                     let usage = final_msg.usage.clone();
-                                                    let _ =
-                                                        &options.messages.push(TaggedMessage::new(
-                                                            current_step_id.to_owned(),
-                                                            Message::Assistant(
-                                                                AssistantMessage::new(
-                                                                    LanguageModelResponseContentType::ToolCall(
-                                                                        tool_info.clone(),
-                                                                    ),
-                                                                    usage,
+                                                    options.messages.push(TaggedMessage::new(
+                                                        current_step_id,
+                                                        Message::Assistant(
+                                                            AssistantMessage::new(
+                                                                LanguageModelResponseContentType::ToolCall(
+                                                                    tool_info.clone(),
                                                                 ),
+                                                                usage,
                                                             ),
-                                                        ));
-                                                    options.handle_tool_call(tool_info).await;
+                                                        ),
+                                                    ));
+                                                    // Collect for parallel execution after stream
+                                                    tool_calls_to_execute.push(tool_info.clone());
                                                 }
                                             }
                                             _ => {}
@@ -359,6 +362,11 @@ impl<M: LanguageModel> LanguageModelRequest<M> {
                         None => {}
                         _ => break,
                     };
+                }
+
+                // Execute all collected tool calls in parallel after stream completes
+                if !tool_calls_to_execute.is_empty() {
+                    options.handle_tool_calls(&tool_calls_to_execute).await;
                 }
 
                 match options.stop_reason {

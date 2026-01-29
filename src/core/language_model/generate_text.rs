@@ -8,7 +8,7 @@ use crate::core::{
         LanguageModelResponseContentType, StopReason, request::LanguageModelRequest,
     },
     messages::{TaggedMessage, TaggedMessageHelpers},
-    tools::{ToolApprovalRequest, ToolApprovalResponse, ToolResultInfo},
+    tools::{ToolApprovalRequest, ToolApprovalResponse, ToolCallInfo, ToolResultInfo},
     utils::resolve_message,
 };
 use crate::error::Result;
@@ -199,6 +199,9 @@ impl<M: LanguageModel> LanguageModelRequest<M> {
             // Track if we have any tool calls requiring approval in this step
             let mut has_approval_requests = false;
 
+            // Collect tool calls for parallel execution
+            let mut tool_calls_to_execute: Vec<ToolCallInfo> = Vec::new();
+
             for output in response.contents.iter() {
                 match output {
                     LanguageModelResponseContentType::Text(text) => {
@@ -250,20 +253,26 @@ impl<M: LanguageModel> LanguageModelRequest<M> {
                             ));
                             has_approval_requests = true;
                         } else {
-                            // Execute tool immediately (original behavior)
+                            // Add assistant message for tool call
                             let usage = response.usage.clone();
-                            let _ = &options.messages.push(TaggedMessage::new(
-                                options.current_step_id.to_owned(),
+                            options.messages.push(TaggedMessage::new(
+                                options.current_step_id,
                                 Message::Assistant(AssistantMessage::new(
                                     LanguageModelResponseContentType::ToolCall(tool_info.clone()),
                                     usage,
                                 )),
                             ));
-                            options.handle_tool_call(tool_info).await;
+                            // Collect for parallel execution
+                            tool_calls_to_execute.push(tool_info.clone());
                         }
                     }
                     _ => (),
                 }
+            }
+
+            // Execute all collected tool calls in parallel
+            if !tool_calls_to_execute.is_empty() {
+                options.handle_tool_calls(&tool_calls_to_execute).await;
             }
 
             // Finish the step

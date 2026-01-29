@@ -303,29 +303,54 @@ impl LanguageModelOptions {
 
     /// Executes a tool call and adds the result to the message history.
     pub(crate) async fn handle_tool_call(&mut self, input: &ToolCallInfo) -> &mut Self {
+        self.handle_tool_calls(std::slice::from_ref(input)).await
+    }
+
+    /// Executes multiple tool calls in parallel and adds their results to the message history.
+    ///
+    /// This method spawns all tool executions concurrently and waits for all of them
+    /// to complete before adding the results to messages. Results are added in the
+    /// same order as the input tool calls, regardless of which tools complete first.
+    pub(crate) async fn handle_tool_calls(&mut self, inputs: &[ToolCallInfo]) -> &mut Self {
+        if inputs.is_empty() {
+            return self;
+        }
+
         if let Some(tools) = &self.tools {
-            let tool_result_task = tools.execute(input.clone()).await;
-            let tool_result = tool_result_task
-                .await
-                .map_err(|err| Error::ToolCallError(format!("Error executing tool: {}", err)))
-                .and_then(|result| result);
+            // Spawn all tool executions in parallel
+            let mut tasks = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                let task = tools.execute(input.clone()).await;
+                tasks.push((input.clone(), task));
+            }
 
-            let mut tool_output_infos = Vec::new();
+            // Wait for all tasks to complete in parallel using join_all
+            let results: Vec<_> = futures::future::join_all(
+                tasks
+                    .into_iter()
+                    .map(|(input, handle)| async move { (input, handle.await) }),
+            )
+            .await;
 
-            let mut tool_output_info = ToolResultInfo::new(&input.tool.name);
-            let output = match tool_result {
-                Ok(result) => serde_json::Value::String(result),
-                Err(err) => serde_json::Value::String(format!("Error: {}", err)),
-            };
-            tool_output_info.output(output);
-            tool_output_info.id(&input.tool.id);
-            tool_output_infos.push(tool_output_info.clone());
+            // Process results in order and add to messages
+            for (input, join_result) in results {
+                let tool_result = join_result
+                    .map_err(|err| Error::ToolCallError(format!("Error executing tool: {}", err)))
+                    .and_then(|result| result);
 
-            // update messages
-            self.messages.push(TaggedMessage::new(
-                self.current_step_id,
-                Message::Tool(tool_output_info),
-            ));
+                let mut tool_output_info = ToolResultInfo::new(&input.tool.name);
+                let output = match tool_result {
+                    Ok(result) => serde_json::Value::String(result),
+                    Err(err) => serde_json::Value::String(format!("Error: {}", err)),
+                };
+                tool_output_info.output(output);
+                tool_output_info.id(&input.tool.id);
+
+                self.messages.push(TaggedMessage::new(
+                    self.current_step_id,
+                    Message::Tool(tool_output_info),
+                ));
+            }
 
             self
         } else {
@@ -1010,6 +1035,345 @@ mod tests {
         assert_eq!(results.len(), 1000);
         for (i, result) in results.iter().enumerate() {
             assert_eq!(result.tool.name, format!("tool{}", i));
+        }
+    }
+
+    // ============================================================================
+    // Parallel Tool Execution Tests
+    // ============================================================================
+
+    use crate::core::tools::{NeedsApproval, Tool, ToolExecute, ToolList};
+    use schemars::schema_for;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+    struct EmptyInput {}
+
+    fn create_test_tool(name: &str, result: &str) -> Tool {
+        let result = result.to_string();
+        Tool {
+            name: name.to_string(),
+            description: format!("Test tool {}", name),
+            input_schema: schema_for!(EmptyInput),
+            execute: ToolExecute::new(Box::new(move |_| Ok(result.clone()))),
+            needs_approval: NeedsApproval::Never,
+        }
+    }
+
+    fn create_failing_tool(name: &str, error_msg: &str) -> Tool {
+        let error_msg = error_msg.to_string();
+        Tool {
+            name: name.to_string(),
+            description: format!("Failing test tool {}", name),
+            input_schema: schema_for!(EmptyInput),
+            execute: ToolExecute::new(Box::new(move |_| Err(error_msg.clone()))),
+            needs_approval: NeedsApproval::Never,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_tool_calls_empty_input() {
+        let mut options = LanguageModelOptions::default();
+        options.tools = Some(ToolList::new(vec![create_test_tool("tool1", "result1")]));
+
+        options.handle_tool_calls(&[]).await;
+
+        // No messages should be added
+        assert!(options.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handle_tool_calls_single_tool() {
+        let mut options = LanguageModelOptions::default();
+        options.tools = Some(ToolList::new(vec![create_test_tool("tool1", "result1")]));
+
+        let tool_call = ToolCallInfo::new("tool1");
+        options.handle_tool_calls(&[tool_call]).await;
+
+        assert_eq!(options.messages.len(), 1);
+        if let Message::Tool(result) = &options.messages[0].message {
+            assert_eq!(result.tool.name, "tool1");
+            assert_eq!(
+                result.output,
+                Ok(serde_json::Value::String("result1".to_string()))
+            );
+        } else {
+            panic!("Expected Tool message");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_tool_calls_multiple_tools_results_in_order() {
+        let mut options = LanguageModelOptions::default();
+        options.tools = Some(ToolList::new(vec![
+            create_test_tool("tool1", "result1"),
+            create_test_tool("tool2", "result2"),
+            create_test_tool("tool3", "result3"),
+        ]));
+
+        let tool_calls = vec![
+            ToolCallInfo::new("tool1"),
+            ToolCallInfo::new("tool2"),
+            ToolCallInfo::new("tool3"),
+        ];
+        options.handle_tool_calls(&tool_calls).await;
+
+        assert_eq!(options.messages.len(), 3);
+
+        // Verify results are in the correct order
+        for (i, msg) in options.messages.iter().enumerate() {
+            if let Message::Tool(result) = &msg.message {
+                assert_eq!(result.tool.name, format!("tool{}", i + 1));
+                assert_eq!(
+                    result.output,
+                    Ok(serde_json::Value::String(format!("result{}", i + 1)))
+                );
+            } else {
+                panic!("Expected Tool message at index {}", i);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_tool_calls_all_tools_executed() {
+        // Verify that all tool calls are executed and results collected
+        let execution_order = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut tools = Vec::new();
+        for i in 1..=5 {
+            let order = execution_order.clone();
+            let name = format!("tool{}", i);
+            let result = format!("result{}", i);
+            tools.push(Tool {
+                name: name.clone(),
+                description: format!("Test tool {}", i),
+                input_schema: schema_for!(EmptyInput),
+                execute: ToolExecute::new(Box::new(move |_| {
+                    order.lock().unwrap().push(name.clone());
+                    Ok(result.clone())
+                })),
+                needs_approval: NeedsApproval::Never,
+            });
+        }
+
+        let mut options = LanguageModelOptions::default();
+        options.tools = Some(ToolList::new(tools));
+
+        let tool_calls: Vec<ToolCallInfo> = (1..=5)
+            .map(|i| ToolCallInfo::new(format!("tool{}", i)))
+            .collect();
+
+        options.handle_tool_calls(&tool_calls).await;
+
+        // Verify all tools were executed
+        let executed = execution_order.lock().unwrap();
+        assert_eq!(executed.len(), 5, "All 5 tools should have been executed");
+
+        // Verify all messages were added
+        assert_eq!(options.messages.len(), 5);
+
+        // Verify results are in the correct order (matching input order)
+        for (i, msg) in options.messages.iter().enumerate() {
+            if let Message::Tool(result) = &msg.message {
+                assert_eq!(result.tool.name, format!("tool{}", i + 1));
+                assert_eq!(
+                    result.output,
+                    Ok(serde_json::Value::String(format!("result{}", i + 1)))
+                );
+            } else {
+                panic!("Expected Tool message at index {}", i);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_tool_calls_with_error() {
+        let mut options = LanguageModelOptions::default();
+        options.tools = Some(ToolList::new(vec![create_failing_tool(
+            "failing_tool",
+            "Something went wrong",
+        )]));
+
+        let tool_call = ToolCallInfo::new("failing_tool");
+        options.handle_tool_calls(&[tool_call]).await;
+
+        assert_eq!(options.messages.len(), 1);
+        if let Message::Tool(result) = &options.messages[0].message {
+            assert_eq!(result.tool.name, "failing_tool");
+            // Error should be captured in the output
+            let output_str = result.output.as_ref().unwrap().as_str().unwrap();
+            assert!(output_str.contains("Error"));
+            assert!(output_str.contains("Something went wrong"));
+        } else {
+            panic!("Expected Tool message");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_tool_calls_mixed_success_and_failure() {
+        let mut options = LanguageModelOptions::default();
+        options.tools = Some(ToolList::new(vec![
+            create_test_tool("success1", "good1"),
+            create_failing_tool("fail1", "bad1"),
+            create_test_tool("success2", "good2"),
+        ]));
+
+        let tool_calls = vec![
+            ToolCallInfo::new("success1"),
+            ToolCallInfo::new("fail1"),
+            ToolCallInfo::new("success2"),
+        ];
+        options.handle_tool_calls(&tool_calls).await;
+
+        assert_eq!(options.messages.len(), 3);
+
+        // First tool: success
+        if let Message::Tool(result) = &options.messages[0].message {
+            assert_eq!(result.tool.name, "success1");
+            assert_eq!(
+                result.output,
+                Ok(serde_json::Value::String("good1".to_string()))
+            );
+        }
+
+        // Second tool: failure
+        if let Message::Tool(result) = &options.messages[1].message {
+            assert_eq!(result.tool.name, "fail1");
+            let output_str = result.output.as_ref().unwrap().as_str().unwrap();
+            assert!(output_str.contains("Error"));
+        }
+
+        // Third tool: success
+        if let Message::Tool(result) = &options.messages[2].message {
+            assert_eq!(result.tool.name, "success2");
+            assert_eq!(
+                result.output,
+                Ok(serde_json::Value::String("good2".to_string()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_tool_calls_tool_not_found() {
+        let mut options = LanguageModelOptions::default();
+        options.tools = Some(ToolList::new(vec![create_test_tool("tool1", "result1")]));
+
+        let tool_call = ToolCallInfo::new("nonexistent_tool");
+        options.handle_tool_calls(&[tool_call]).await;
+
+        assert_eq!(options.messages.len(), 1);
+        if let Message::Tool(result) = &options.messages[0].message {
+            assert_eq!(result.tool.name, "nonexistent_tool");
+            let output_str = result.output.as_ref().unwrap().as_str().unwrap();
+            assert!(output_str.contains("Error"));
+            assert!(output_str.contains("Tool not found"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_tool_calls_no_tools_configured() {
+        let mut options = LanguageModelOptions::default();
+        // tools is None
+
+        let tool_call = ToolCallInfo::new("tool1");
+        options.handle_tool_calls(&[tool_call]).await;
+
+        // No messages should be added when tools are not configured
+        assert!(options.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handle_tool_calls_preserves_tool_ids() {
+        let mut options = LanguageModelOptions::default();
+        options.tools = Some(ToolList::new(vec![
+            create_test_tool("tool1", "result1"),
+            create_test_tool("tool2", "result2"),
+        ]));
+
+        let mut call1 = ToolCallInfo::new("tool1");
+        call1.id("custom-id-1");
+        let mut call2 = ToolCallInfo::new("tool2");
+        call2.id("custom-id-2");
+
+        options.handle_tool_calls(&[call1, call2]).await;
+
+        assert_eq!(options.messages.len(), 2);
+
+        if let Message::Tool(result) = &options.messages[0].message {
+            assert_eq!(result.tool.id, "custom-id-1");
+        }
+        if let Message::Tool(result) = &options.messages[1].message {
+            assert_eq!(result.tool.id, "custom-id-2");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_tool_calls_uses_current_step_id() {
+        let mut options = LanguageModelOptions::default();
+        options.current_step_id = 5;
+        options.tools = Some(ToolList::new(vec![
+            create_test_tool("tool1", "result1"),
+            create_test_tool("tool2", "result2"),
+        ]));
+
+        let tool_calls = vec![ToolCallInfo::new("tool1"), ToolCallInfo::new("tool2")];
+        options.handle_tool_calls(&tool_calls).await;
+
+        assert_eq!(options.messages.len(), 2);
+        assert_eq!(options.messages[0].step_id, 5);
+        assert_eq!(options.messages[1].step_id, 5);
+    }
+
+    #[tokio::test]
+    async fn test_handle_tool_call_single_delegates_to_handle_tool_calls() {
+        let mut options = LanguageModelOptions::default();
+        options.tools = Some(ToolList::new(vec![create_test_tool("tool1", "result1")]));
+
+        let tool_call = ToolCallInfo::new("tool1");
+        options.handle_tool_call(&tool_call).await;
+
+        assert_eq!(options.messages.len(), 1);
+        if let Message::Tool(result) = &options.messages[0].message {
+            assert_eq!(result.tool.name, "tool1");
+            assert_eq!(
+                result.output,
+                Ok(serde_json::Value::String("result1".to_string()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_tool_calls_same_tool_multiple_times() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let mut options = LanguageModelOptions::default();
+        options.tools = Some(ToolList::new(vec![Tool {
+            name: "counter".to_string(),
+            description: "Counts calls".to_string(),
+            input_schema: schema_for!(EmptyInput),
+            execute: ToolExecute::new(Box::new(move |_| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                Ok(format!("call_{}", count))
+            })),
+            needs_approval: NeedsApproval::Never,
+        }]));
+
+        let tool_calls = vec![
+            ToolCallInfo::new("counter"),
+            ToolCallInfo::new("counter"),
+            ToolCallInfo::new("counter"),
+        ];
+        options.handle_tool_calls(&tool_calls).await;
+
+        assert_eq!(options.messages.len(), 3);
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+
+        // All three should have the counter tool name
+        for msg in &options.messages {
+            if let Message::Tool(result) = &msg.message {
+                assert_eq!(result.tool.name, "counter");
+            }
         }
     }
 }

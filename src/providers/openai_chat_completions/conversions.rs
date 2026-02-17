@@ -6,6 +6,26 @@ use crate::core::language_model::{
 use crate::core::messages::Message;
 use crate::core::tools::Tool as SdkTool;
 use crate::providers::openai_chat_completions::client::{self, types};
+use std::collections::HashMap;
+
+fn extract_header_value(
+    headers: Option<&HashMap<String, String>>,
+    keys: &[&str],
+) -> Option<String> {
+    let headers = headers?;
+    for key in keys {
+        if let Some((_, value)) = headers
+            .iter()
+            .find(|(header_name, _)| header_name.eq_ignore_ascii_case(key))
+        {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
 
 // ============================================================================
 // LanguageModelOptions -> ChatCompletionsOptions
@@ -13,12 +33,30 @@ use crate::providers::openai_chat_completions::client::{self, types};
 
 impl From<LanguageModelOptions> for client::ChatCompletionsOptions {
     fn from(options: LanguageModelOptions) -> Self {
+        let prompt_cache_key = extract_header_value(
+            options.headers.as_ref(),
+            &[
+                "x-prompt-cache-key",
+                "prompt_cache_key",
+                "prompt-cache-key",
+                "session_id",
+            ],
+        );
+        let prompt_cache_retention = extract_header_value(
+            options.headers.as_ref(),
+            &[
+                "x-prompt-cache-retention",
+                "prompt_cache_retention",
+                "prompt-cache-retention",
+            ],
+        );
+
         let mut messages: Vec<types::ChatMessage> = Vec::new();
 
         if let Some(system_prompt) = options.system {
             messages.push(types::ChatMessage {
                 role: types::Role::System,
-                content: Some(system_prompt),
+                content: Some(types::ChatMessageContent::text(system_prompt)),
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -98,6 +136,8 @@ impl From<LanguageModelOptions> for client::ChatCompletionsOptions {
             parallel_tool_calls: Some(true),
             reasoning_effort,
             verbosity: None,
+            prompt_cache_key,
+            prompt_cache_retention,
         }
     }
 }
@@ -111,14 +151,14 @@ impl From<Message> for types::ChatMessage {
         match msg {
             Message::System(s) => types::ChatMessage {
                 role: types::Role::System,
-                content: Some(s.content),
+                content: Some(types::ChatMessageContent::text(s.content)),
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
             },
             Message::User(u) => types::ChatMessage {
                 role: types::Role::User,
-                content: Some(u.content),
+                content: Some(types::ChatMessageContent::text(u.content)),
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -126,14 +166,14 @@ impl From<Message> for types::ChatMessage {
             Message::Assistant(a) => match a.content {
                 LanguageModelResponseContentType::Text(text) => types::ChatMessage {
                     role: types::Role::Assistant,
-                    content: Some(text),
+                    content: Some(types::ChatMessageContent::text(text)),
                     name: None,
                     tool_calls: None,
                     tool_call_id: None,
                 },
                 LanguageModelResponseContentType::ToolCall(tool_info) => types::ChatMessage {
                     role: types::Role::Assistant,
-                    content: Some("".to_string()),
+                    content: Some(types::ChatMessageContent::text(String::new())),
                     name: None,
                     tool_calls: Some(vec![types::ToolCall {
                         id: tool_info.tool.id.clone(),
@@ -150,7 +190,10 @@ impl From<Message> for types::ChatMessage {
                     // Include as text with prefix
                     types::ChatMessage {
                         role: types::Role::Assistant,
-                        content: Some(format!("[Reasoning]: {}", content)),
+                        content: Some(types::ChatMessageContent::text(format!(
+                            "[Reasoning]: {}",
+                            content
+                        ))),
                         name: None,
                         tool_calls: None,
                         tool_call_id: None,
@@ -166,19 +209,19 @@ impl From<Message> for types::ChatMessage {
             },
             Message::Tool(tool_result) => types::ChatMessage {
                 role: types::Role::Tool,
-                content: Some(
+                content: Some(types::ChatMessageContent::text(
                     tool_result
                         .output
                         .unwrap_or_else(|e| serde_json::Value::String(e.to_string()))
                         .to_string(),
-                ),
+                )),
                 name: Some(tool_result.tool.name),
                 tool_calls: None,
                 tool_call_id: Some(tool_result.tool.id),
             },
             Message::Developer(d) => types::ChatMessage {
                 role: types::Role::Developer,
-                content: Some(d),
+                content: Some(types::ChatMessageContent::text(d)),
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -255,6 +298,7 @@ impl From<types::Usage> for Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_message_conversion_system() {
@@ -262,7 +306,10 @@ mod tests {
         let chat_msg: types::ChatMessage = msg.into();
 
         assert_eq!(chat_msg.role, types::Role::System);
-        assert_eq!(chat_msg.content, Some("You are helpful".to_string()));
+        assert_eq!(
+            chat_msg.content,
+            Some(types::ChatMessageContent::text("You are helpful"))
+        );
         assert!(chat_msg.tool_calls.is_none());
     }
 
@@ -272,7 +319,10 @@ mod tests {
         let chat_msg: types::ChatMessage = msg.into();
 
         assert_eq!(chat_msg.role, types::Role::User);
-        assert_eq!(chat_msg.content, Some("Hello".to_string()));
+        assert_eq!(
+            chat_msg.content,
+            Some(types::ChatMessageContent::text("Hello"))
+        );
     }
 
     #[test]
@@ -331,5 +381,39 @@ mod tests {
         assert_eq!(sdk_usage.output_tokens, Some(50));
         assert_eq!(sdk_usage.cached_tokens, Some(20));
         assert_eq!(sdk_usage.reasoning_tokens, Some(10));
+    }
+
+    #[test]
+    fn test_prompt_cache_key_uses_custom_header() {
+        let options = LanguageModelOptions {
+            headers: Some(HashMap::from([(
+                "x-prompt-cache-key".to_string(),
+                "session-456".to_string(),
+            )])),
+            ..Default::default()
+        };
+
+        let completions_opts: client::ChatCompletionsOptions = options.into();
+        assert_eq!(
+            completions_opts.prompt_cache_key.as_deref(),
+            Some("session-456")
+        );
+    }
+
+    #[test]
+    fn test_prompt_cache_key_falls_back_to_session_id_header() {
+        let options = LanguageModelOptions {
+            headers: Some(HashMap::from([(
+                "session_id".to_string(),
+                "session-789".to_string(),
+            )])),
+            ..Default::default()
+        };
+
+        let completions_opts: client::ChatCompletionsOptions = options.into();
+        assert_eq!(
+            completions_opts.prompt_cache_key.as_deref(),
+            Some("session-789")
+        );
     }
 }

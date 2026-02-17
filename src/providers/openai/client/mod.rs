@@ -42,6 +42,12 @@ pub(crate) struct OpenAIOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub(crate) tools: Option<Vec<ToolParams>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub(crate) prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub(crate) prompt_cache_retention: Option<String>,
 }
 
 impl OpenAIOptions {

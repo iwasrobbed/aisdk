@@ -8,6 +8,26 @@ use crate::core::tools::Tool;
 use crate::providers::openai::client::{self, types};
 use schemars::Schema;
 use serde_json::Value;
+use std::collections::HashMap;
+
+fn extract_header_value(
+    headers: Option<&HashMap<String, String>>,
+    keys: &[&str],
+) -> Option<String> {
+    let headers = headers?;
+    for key in keys {
+        if let Some((_, value)) = headers
+            .iter()
+            .find(|(header_name, _)| header_name.eq_ignore_ascii_case(key))
+        {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
 
 impl From<Tool> for types::ToolParams {
     fn from(value: Tool) -> Self {
@@ -34,6 +54,24 @@ impl From<Tool> for types::ToolParams {
 
 impl From<LanguageModelOptions> for client::OpenAIOptions {
     fn from(options: LanguageModelOptions) -> Self {
+        let prompt_cache_key = extract_header_value(
+            options.headers.as_ref(),
+            &[
+                "x-prompt-cache-key",
+                "prompt_cache_key",
+                "prompt-cache-key",
+                "session_id",
+            ],
+        );
+        let prompt_cache_retention = extract_header_value(
+            options.headers.as_ref(),
+            &[
+                "x-prompt-cache-retention",
+                "prompt_cache_retention",
+                "prompt-cache-retention",
+            ],
+        );
+
         let items: Vec<types::InputItem> = options
             .messages
             .into_iter()
@@ -74,6 +112,8 @@ impl From<LanguageModelOptions> for client::OpenAIOptions {
             stream: Some(false),
             top_p: options.top_p.map(|t| t as f32 / 100.0),
             tools,
+            prompt_cache_key,
+            prompt_cache_retention,
         }
     }
 }
@@ -202,6 +242,7 @@ mod tests {
     use crate::core::language_model::{
         LanguageModelOptions, ReasoningEffort as LMReasoningEffort, Usage,
     };
+    use std::collections::HashMap;
 
     #[test]
     fn test_reasoning_effort_conversion_low() {
@@ -290,5 +331,46 @@ mod tests {
         // These will be 0 because the details are default (None)
         assert_eq!(usage.cached_tokens, Some(0));
         assert_eq!(usage.reasoning_tokens, Some(0));
+    }
+
+    #[test]
+    fn test_language_model_options_to_create_response_with_prompt_cache_headers() {
+        let options = LanguageModelOptions {
+            headers: Some(HashMap::from([
+                ("x-prompt-cache-key".to_string(), "session-123".to_string()),
+                (
+                    "x-prompt-cache-retention".to_string(),
+                    "in_memory".to_string(),
+                ),
+            ])),
+            ..Default::default()
+        };
+
+        let create_response: OpenAIOptions = options.into();
+        assert_eq!(
+            create_response.prompt_cache_key.as_deref(),
+            Some("session-123")
+        );
+        assert_eq!(
+            create_response.prompt_cache_retention.as_deref(),
+            Some("in_memory")
+        );
+    }
+
+    #[test]
+    fn test_language_model_options_uses_session_id_for_prompt_cache_key() {
+        let options = LanguageModelOptions {
+            headers: Some(HashMap::from([(
+                "session_id".to_string(),
+                "session-from-header".to_string(),
+            )])),
+            ..Default::default()
+        };
+
+        let create_response: OpenAIOptions = options.into();
+        assert_eq!(
+            create_response.prompt_cache_key.as_deref(),
+            Some("session-from-header")
+        );
     }
 }

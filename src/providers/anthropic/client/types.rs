@@ -142,6 +142,35 @@ pub(crate) enum AnthropicCitation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum AnthropicSystemPrompt {
+    Text(String),
+    Blocks(Vec<AnthropicSystemMessageContentBlock>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub(crate) enum AnthropicSystemMessageContentBlock {
+    #[serde(rename = "text")]
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Prompt caching configuration for Anthropic text blocks.
+pub struct AnthropicCacheControl {
+    /// Cache type (for example, `ephemeral`).
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// Optional cache TTL override (for example, `5m` or `1h`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role")]
 pub(crate) enum AnthropicMessageParam {
     #[serde(rename = "user")]
@@ -173,6 +202,9 @@ pub enum AnthropicUserMessageContentBlock {
     Text {
         /// The text content
         text: String,
+        /// Optional prompt caching directive for this content block.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
     #[serde(rename = "tool_result")]
     /// Tool result content

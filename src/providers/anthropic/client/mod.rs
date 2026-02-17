@@ -30,7 +30,7 @@ pub(crate) struct AnthropicOptions {
     pub stream: Option<bool>,
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<String>,
+    pub system: Option<AnthropicSystemPrompt>,
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,

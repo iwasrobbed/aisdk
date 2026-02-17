@@ -3,16 +3,127 @@ use crate::core::language_model::{
     LanguageModelOptions, LanguageModelResponseContentType, ReasoningEffort, Usage,
 };
 use crate::providers::anthropic::client::{
-    AnthropicAssistantMessageParamContent, AnthropicMessageDeltaUsage, AnthropicMessageParam,
-    AnthropicOptions, AnthropicThinking, AnthropicTool, AnthropicUsage,
+    AnthropicAssistantMessageParamContent, AnthropicCacheControl, AnthropicMessageDeltaUsage,
+    AnthropicMessageParam, AnthropicOptions, AnthropicSystemMessageContentBlock,
+    AnthropicSystemPrompt, AnthropicThinking, AnthropicTool, AnthropicUsage,
+    AnthropicUserMessageContent, AnthropicUserMessageContentBlock,
 };
 use crate::providers::anthropic::extensions;
+use std::collections::HashMap;
+
+fn extract_header_value(
+    headers: Option<&HashMap<String, String>>,
+    keys: &[&str],
+) -> Option<String> {
+    let headers = headers?;
+    for key in keys {
+        if let Some((_, value)) = headers
+            .iter()
+            .find(|(header_name, _)| header_name.eq_ignore_ascii_case(key))
+        {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn prompt_cache_control_from_headers(
+    headers: Option<&HashMap<String, String>>,
+) -> Option<AnthropicCacheControl> {
+    let has_cache_key = extract_header_value(
+        headers,
+        &[
+            "x-prompt-cache-key",
+            "prompt_cache_key",
+            "prompt-cache-key",
+            "session_id",
+        ],
+    )
+    .is_some();
+    if !has_cache_key {
+        return None;
+    }
+
+    let ttl = extract_header_value(
+        headers,
+        &["x-prompt-cache-ttl", "prompt_cache_ttl", "prompt-cache-ttl"],
+    );
+
+    Some(AnthropicCacheControl {
+        type_: "ephemeral".to_string(),
+        ttl,
+    })
+}
+
+fn system_prompt_with_optional_cache(
+    system: String,
+    cache_control: Option<&AnthropicCacheControl>,
+) -> AnthropicSystemPrompt {
+    if let Some(cache_control) = cache_control {
+        AnthropicSystemPrompt::Blocks(vec![AnthropicSystemMessageContentBlock::Text {
+            text: system,
+            cache_control: Some(cache_control.clone()),
+        }])
+    } else {
+        AnthropicSystemPrompt::Text(system)
+    }
+}
+
+fn apply_prompt_cache_to_first_user_message(
+    messages: &mut [AnthropicMessageParam],
+    cache_control: &AnthropicCacheControl,
+) {
+    for message in messages.iter_mut() {
+        let AnthropicMessageParam::User { content } = message else {
+            continue;
+        };
+
+        match content {
+            AnthropicUserMessageContent::Text(text) => {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let content_text = std::mem::take(text);
+                *content = AnthropicUserMessageContent::Blocks(vec![
+                    AnthropicUserMessageContentBlock::Text {
+                        text: content_text,
+                        cache_control: Some(cache_control.clone()),
+                    },
+                ]);
+                return;
+            }
+            AnthropicUserMessageContent::Blocks(blocks) => {
+                for block in blocks.iter_mut() {
+                    let AnthropicUserMessageContentBlock::Text {
+                        text,
+                        cache_control: block_cache_control,
+                    } = block
+                    else {
+                        continue;
+                    };
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    if block_cache_control.is_none() {
+                        *block_cache_control = Some(cache_control.clone());
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
 
 impl From<LanguageModelOptions> for AnthropicOptions {
     fn from(options: LanguageModelOptions) -> Self {
         let mut messages = Vec::new();
         let mut request = AnthropicOptions::builder();
         request.model("");
+        let prompt_cache_control = prompt_cache_control_from_headers(options.headers.as_ref());
+        let mut has_system_prompt = false;
 
         // TODO: anthropic max_tokens is required. handle compile
         // time checks if not set in core
@@ -21,7 +132,11 @@ impl From<LanguageModelOptions> for AnthropicOptions {
         if let Some(system) = options.system
             && !system.is_empty()
         {
-            request.system(Some(system));
+            request.system(Some(system_prompt_with_optional_cache(
+                system,
+                prompt_cache_control.as_ref(),
+            )));
+            has_system_prompt = true;
         } else {
             request.system(None);
         }
@@ -31,15 +146,16 @@ impl From<LanguageModelOptions> for AnthropicOptions {
             match msg.message {
                 Message::System(s) => {
                     if !s.content.is_empty() {
-                        request.system(Some(s.content));
+                        request.system(Some(system_prompt_with_optional_cache(
+                            s.content,
+                            prompt_cache_control.as_ref(),
+                        )));
+                        has_system_prompt = true;
                     }
                 }
                 Message::User(u) => {
                     messages.push(AnthropicMessageParam::User {
-                        content:
-                            crate::providers::anthropic::client::AnthropicUserMessageContent::Text(
-                                u.content,
-                            ),
+                        content: AnthropicUserMessageContent::Text(u.content),
                     });
                 }
                 Message::Assistant(a) => match a.content {
@@ -81,8 +197,8 @@ impl From<LanguageModelOptions> for AnthropicOptions {
                 },
                 Message::Tool(tool) => {
                     messages.push(AnthropicMessageParam::User {
-                        content: crate::providers::anthropic::client::AnthropicUserMessageContent::Blocks(vec![
-                            crate::providers::anthropic::client::AnthropicUserMessageContentBlock::ToolResult {
+                        content: AnthropicUserMessageContent::Blocks(vec![
+                            AnthropicUserMessageContentBlock::ToolResult {
                                 tool_use_id: tool.tool.id,
                                 content: tool.output.unwrap_or_default().to_string(),
                             },
@@ -91,15 +207,21 @@ impl From<LanguageModelOptions> for AnthropicOptions {
                 }
                 Message::Developer(dev) => {
                     messages.push(AnthropicMessageParam::User {
-                        content:
-                            crate::providers::anthropic::client::AnthropicUserMessageContent::Text(
-                                format!("<developer>\n{}\n</developer>", dev),
-                            ),
+                        content: AnthropicUserMessageContent::Text(format!(
+                            "<developer>\n{}\n</developer>",
+                            dev
+                        )),
                     });
                 }
                 // Tool approval messages are handled internally by the SDK
                 Message::ToolApproval(_) => {}
             }
+        }
+
+        if let Some(cache_control) = prompt_cache_control.as_ref()
+            && !has_system_prompt
+        {
+            apply_prompt_cache_to_first_user_message(&mut messages, cache_control);
         }
         // update messages
         request.messages(messages);
@@ -170,5 +292,64 @@ impl From<AnthropicMessageDeltaUsage> for Usage {
             ),
             reasoning_tokens: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::messages::UserMessage;
+
+    #[test]
+    fn prompt_cache_key_adds_cache_control_to_system_prompt() {
+        let options = LanguageModelOptions {
+            system: Some("System instructions".to_string()),
+            headers: Some(HashMap::from([(
+                "x-prompt-cache-key".to_string(),
+                "session-abc".to_string(),
+            )])),
+            ..Default::default()
+        };
+
+        let request: AnthropicOptions = options.into();
+        let Some(AnthropicSystemPrompt::Blocks(blocks)) = request.system else {
+            panic!("expected system blocks");
+        };
+        let Some(AnthropicSystemMessageContentBlock::Text { cache_control, .. }) = blocks.first()
+        else {
+            panic!("expected text system block");
+        };
+        assert_eq!(
+            cache_control.as_ref().map(|value| value.type_.as_str()),
+            Some("ephemeral")
+        );
+    }
+
+    #[test]
+    fn prompt_cache_key_adds_cache_control_to_first_user_without_system_prompt() {
+        let options = LanguageModelOptions {
+            messages: vec![Message::User(UserMessage::new("User prompt")).into()],
+            headers: Some(HashMap::from([(
+                "session_id".to_string(),
+                "session-xyz".to_string(),
+            )])),
+            ..Default::default()
+        };
+
+        let request: AnthropicOptions = options.into();
+        let Some(AnthropicMessageParam::User { content }) = request.messages.first() else {
+            panic!("expected first user message");
+        };
+        let AnthropicUserMessageContent::Blocks(blocks) = content else {
+            panic!("expected user content blocks");
+        };
+        let Some(AnthropicUserMessageContentBlock::Text { cache_control, .. }) = blocks.first()
+        else {
+            panic!("expected user text block");
+        };
+        assert_eq!(
+            cache_control.as_ref().map(|value| value.type_.as_str()),
+            Some("ephemeral")
+        );
     }
 }
